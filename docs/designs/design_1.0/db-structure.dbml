@@ -1,0 +1,160 @@
+Project contenthub {
+  Note: '''
+    ContentHub 1.0: connection-authorized retrieval with acknowledged-delivery
+    deduplication. Standalone replacement design, not an executable migration.
+    Earlier checkpoints and any existing archive data are not deleted.
+
+    Two tables: subscriptions and delivery_attempts.
+    No persisted content, raw payloads, cleaned results, item registry,
+    memberships, content corrections, durable queues, cursors, or run recovery.
+    Agents/connections/grants are proposed owner-file configuration with stable
+    IDs; agents cannot change grants or credentials through subscription tools.
+    No database FK points to owner configuration. Validate live references.
+    Historical subscription_id on attempts is intentionally not a FK:
+    deleting a subscription keeps its ledger records. Never reuse IDs.
+
+    Single-selector subscriptions are editable at runtime by their owner.
+    A selector may accept several targets of the same supported type.
+    Initial collection is proposed pull-driven, not automatic startup polling.
+    Shared bounded asyncio discovery/fetch queues serve all agents without
+    cross-agent content sharing. Preparation runs inside the fetch task.
+    Runtime buffers and work disappear on restart; the ledger is not a queue.
+
+    All direct/subscription fetches require explicit acknowledgment.
+    Only retained acknowledgments suppress new requests for that agent/item.
+    Raw/cleaned representation is recorded but excluded from item identity.
+    Direct repeats return already_served unless allow_repeat explicitly
+    requests a fresh fetch. A repeat creates another attempt and acknowledgment.
+    Fetch/processing errors are diagnostic, not persistent retry blockers.
+    Current authorization, target verification, and resource checks still apply.
+
+    UTC timestamps, application-generated UUID strings, and SQLite metadata
+    storage are proposed initially. DBML notes require implementation checks;
+    compiling this schema does not validate authorization or runtime semantics.
+  '''
+}
+
+Table subscriptions {
+  id varchar(36) [pk, not null]
+  agent_id varchar(36) [not null, note: 'Immutable owning agent ID from owner configuration; not caller-selected authority']
+  name varchar(255) [not null]
+  connection_id varchar(36) [not null, note: 'One currently granted stable connection ID; live validity checked by service']
+  selector_type varchar(128) [not null, note: 'Exactly one supported type, e.g. youtube_channels, youtube_playlists, gmail_query']
+  selector_json json [not null, note: 'Validated arguments for one selector type; may contain multiple same-type targets']
+  content_kind varchar(64) [not null]
+  options_json json [not null, note: 'Normalized material requested-content options; {} when none; excludes representation']
+  representation varchar(16) [not null, note: 'raw | cleaned']
+  lookback_seconds bigint [not null, note: 'Positive default collection window duration, shared by all selector targets']
+  created_at timestamp [not null]
+  updated_at timestamp [not null]
+
+  indexes {
+    (agent_id, name) [unique]
+    (agent_id, connection_id)
+  }
+
+  Note: '''
+    Agent-owned active collection rule, not archive permission or YAML registry.
+    One connection, selector type, content request, representation, and lookback.
+    Multiple channels or multiple playlists are valid when supported;
+    channels plus playlists are separate subscriptions.
+    Validate owner grants, selector capabilities, options and positive lookback
+    on creation/update. Snapshots of admitted requests are runtime-only.
+    Updates affect later requests; no settings-revision history is required.
+    Owner identity and subscription ID are immutable; timestamps track rule edits.
+    Missing/revoked configured references make this rule unusable, not deleted.
+    Deletion leaves delivery_attempts and acknowledgments intact and does not
+    implicitly cancel already admitted work. Names are unique per owner only.
+    No schedule column or automatic polling is required in the initial proposal.
+    Selector JSON is not a payload cache, secret store, or provider scan cursor.
+  '''
+}
+
+Table delivery_attempts {
+  id varchar(36) [pk, not null, note: 'Opaque attempt/delivery ID used for acknowledgment; new for every actual repeat']
+  agent_id varchar(36) [not null, note: 'Requesting agent; all ledger access is owner-scoped']
+  connection_id varchar(36) [not null, note: 'Actual authorized execution route, diagnostic rather than item identity']
+  subscription_id varchar(36) [note: 'Optional originating subscription ID; historical metadata without a live FK']
+
+  source varchar(64) [not null]
+  upstream_kind varchar(64) [not null]
+  namespace varchar(255) [not null, note: 'Verified stable upstream identity boundary; explicit empty string for supported public content']
+  source_id varchar(512) [not null]
+  content_kind varchar(64) [not null]
+  options_json json [not null, note: 'Canonical material content options, {} when none; raw/cleaned is not an option here']
+  item_key varchar(64) [not null, note: '64 lowercase hex SHA-256 of canonical six-field identity; deliberately NOT unique']
+
+  representation varchar(16) [not null, note: 'raw | cleaned; either acknowledged representation suppresses the same item']
+  attempted_at timestamp [not null, note: 'Actual item-attempt start; row is persisted on terminal fetch/preparation outcome']
+  fetching_status varchar(16) [not null, note: 'fetched | error; diagnostics only, not queued/running or retry eligibility']
+  fetch_error_code varchar(128)
+  fetch_error_message text [note: 'Sanitized diagnostic; no payloads, credentials or raw provider dumps']
+  processing_error_code varchar(128) [note: 'Fetch succeeded but requested output preparation/validation failed']
+  processing_error_message text [note: 'Sanitized preparation diagnostic only']
+  delivery_time timestamp [note: 'Complete-item response handoff attempt; NULL before complete delivery or on failure']
+  acknowledgement_time timestamp [note: 'First explicit acknowledgment of this delivery; only this field enables suppression']
+
+  indexes {
+    (agent_id, item_key, acknowledgement_time)
+    (agent_id, attempted_at, id)
+    (agent_id, subscription_id, attempted_at)
+    (agent_id, connection_id, attempted_at)
+    acknowledgement_time
+    attempted_at
+  }
+
+  Note: '''
+    One metadata row per terminal item retrieval attempt, not per canonical item.
+    No uniqueness on agent_id/item_key: retries and forced repeats coexist.
+    A crash before terminal insertion can leave no attempt record.
+    No rows for discovery-only references, acknowledged-item skips, or
+    pre-admission validation rejection. This is not a recoverable work log.
+
+    Identity is source + upstream_kind + namespace + source_id + content_kind
+    + normalized material options_json, hashed as structured canonical UTF-8 JSON.
+    Exclude agent, subscription, provider/connection route, representation,
+    delivery timing, retry/override settings, and parser implementation version.
+    Compare full identity on a hash match; mismatch is an integrity error.
+    Normalize defaults and ordering centrally; canonicalization must be stable.
+
+    Check any retained same-agent matching-identity acknowledged row for
+    suppression, regardless of route, subscription, or raw/cleaned representation.
+    Permission and upstream target verification precede the check.
+    An explicit override fetches again and creates another row; failed repeats
+    never overwrite or erase older acknowledgment evidence.
+
+    Fetching error requires fetch_error_code and no processing error,
+    delivery_time, or acknowledgement_time. Fetched requires no fetch errors.
+    Processing errors require fetched and imply no delivery/acknowledgment.
+    Error messages are nullable; a message requires its corresponding code.
+    Successful fetched/prepared rows may remain undelivered/unacknowledged.
+    No field here implements an exhausted retry allowance or permanent blocker.
+
+    Attempt identity/context, outcomes, and attempted_at are immutable after
+    insertion. delivery_time and acknowledgement_time each transition only
+    from NULL to their first assigned UTC timestamp; repeated ack is idempotent.
+    Timestamp order: attempted_at <= delivery_time <= acknowledgement_time
+    whenever these values exist. Enforce in transaction/check constraints.
+    Acknowledgment requires fetched, no preparation error, complete delivery,
+    matching agent ownership, and current authorization.
+
+    Persist delivery_time immediately before final response/chunk handoff.
+    This is an attempted handoff, not atomic proof of network delivery.
+    Without acknowledgment, a lost response never suppresses a new request.
+    For content continuation, only the final complete-item handoff qualifies.
+    Acknowledge by delivery ID; memory/batch cursor state is not required after
+    restart if the completed delivery row is retained and still authorized.
+    Purged IDs are explicitly unknown/expired; never recreate lost receipts.
+
+    No raw bytes, cleaned text, search text, content JSON, credentials, response
+    envelopes, continuation tokens, queued statuses, or batch payloads here.
+    Item metadata/error text must not become a hidden content archive.
+    Acknowledged buffers are released; unacknowledged buffers expire in memory.
+    Purge acknowledged rows by acknowledgement_time, not source publication date.
+    Failed/unacknowledged rows may expire by attempted_at under a separate policy.
+    Purging receipt evidence intentionally permits redelivery.
+    Protect live deliveries from purge and serialize purge with acknowledgment.
+    Historical subscription references are not permission grants and survive
+    subscription deletion without an FK or retained subscription tombstone.
+  '''
+}
