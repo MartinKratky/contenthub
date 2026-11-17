@@ -1,8 +1,9 @@
 Project contenthub {
   Note: '''
-    ContentHub 1.0: connection-authorized retrieval with acknowledged-delivery
-    deduplication. Standalone replacement design, not an executable migration.
-    Earlier checkpoints and any existing archive data are not deleted.
+    ContentHub 1.1: connection-authorized retrieval with acknowledged-delivery
+    deduplication. Based on design_1.0, which is preserved unchanged.
+    Standalone checkpoint, not an executable migration.
+    Existing data must not be deleted automatically.
 
     Two tables: subscriptions and delivery_attempts.
     No persisted content, raw payloads, cleaned results, item registry,
@@ -27,6 +28,22 @@ Project contenthub {
     requests a fresh fetch. A repeat creates another attempt and acknowledgment.
     Fetch/processing errors are diagnostic, not persistent retry blockers.
     Current authorization, target verification, and resource checks still apply.
+
+    Return complete items only, one by one or in bounded whole-item batches.
+    No per-item content chunking or truncation. Oversized items report
+    item_too_large and cannot be delivered or acknowledged.
+    Cursors continue batches of items, never fragments of one item.
+    The lean MCP response omits the item wrapper and redundant
+    content_complete/acknowledgement_required flags; identity stays in the ledger.
+
+    Connections may be granted to several agents and share connection-level
+    concurrency/rate limits. Buffers and receipts remain agent-specific.
+    Namespace equality is identity metadata, not a connection grant.
+    Future archive/vector-search extension notes in design.md introduce no
+    archive tables, version records, embeddings, or indexing jobs in this release.
+    Typed content results are runtime-only. Future stored versions must be
+    independent of delivery IDs; storage handoff/durability needs explicit design.
+    Tables, columns, and indexes remain structurally identical to 1.0.
 
     UTC timestamps, application-generated UUID strings, and SQLite metadata
     storage are proposed initially. DBML notes require implementation checks;
@@ -129,6 +146,13 @@ Table delivery_attempts {
     Error messages are nullable; a message requires its corresponding code.
     Successful fetched/prepared rows may remain undelivered/unacknowledged.
     No field here implements an exhausted retry allowance or permanent blocker.
+    item_too_large before complete upstream acquisition is a fetch error.
+    item_too_large after successful fetching is a preparation error with
+    fetching_status=fetched. Both leave delivery/acknowledgment timestamps NULL.
+    Check complete serialized output size before terminal outcome insertion;
+    no post-insert outcome mutation is needed during batch assembly.
+    Several individually valid items exceeding a batch budget are rebatched,
+    not classified as oversized items. No partial content is delivered.
 
     Attempt identity/context, outcomes, and attempted_at are immutable after
     insertion. delivery_time and acknowledgement_time each transition only
@@ -138,10 +162,11 @@ Table delivery_attempts {
     Acknowledgment requires fetched, no preparation error, complete delivery,
     matching agent ownership, and current authorization.
 
-    Persist delivery_time immediately before final response/chunk handoff.
+    Persist delivery_time immediately before whole-item response handoff.
     This is an attempted handoff, not atomic proof of network delivery.
     Without acknowledgment, a lost response never suppresses a new request.
-    For content continuation, only the final complete-item handoff qualifies.
+    No per-item content continuation exists; only successful complete items
+    in a response qualify. Error entries never acquire delivery_time.
     Acknowledge by delivery ID; memory/batch cursor state is not required after
     restart if the completed delivery row is retained and still authorized.
     Purged IDs are explicitly unknown/expired; never recreate lost receipts.

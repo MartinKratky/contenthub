@@ -1,13 +1,15 @@
-# ContentHub: Design checkpoint 1.0
+# ContentHub: Design checkpoint 1.1
 
-Version: 1.0\
+Version: 1.1\
 Status: Agreed product direction; concrete interface spellings and operating defaults proposed below\
-Predecessor: `designs/design_0.9`, preserved unchanged\
+Predecessor: `designs/design_1.0`, preserved unchanged\
 Working name: `contenthub`
 
 ContentHub is a local, connection-authorized content retrieval service with per-agent acknowledged-delivery deduplication. It is not a content archive. Agents discover upstream objects, explicitly fetch content, manage their own subscriptions, and inspect their delivery ledger through MCP. Content exists only in bounded runtime memory; persistent records describe subscriptions and retrieval attempts, never payloads.
 
-This is a standalone replacement design, not a migration or an implementation. The accompanying `db-structure.dbml` proposes two tables: `subscriptions` and `delivery_attempts`. The table name `delivery_attempts` emphasizes that errors and unacknowledged responses are present alongside acknowledged deliveries.
+This is a standalone checkpoint based on 1.0, not a migration or an implementation. The accompanying `db-structure.dbml` retains two tables: `subscriptions` and `delivery_attempts`. The table name `delivery_attempts` emphasizes that errors and unacknowledged responses are present alongside acknowledged deliveries.
+
+Checkpoint 1.1 adds lean JSON response examples, requires whole-item delivery without per-item chunking, and documents boundaries for an optional future content store and semantic-search index. Those extension notes do not introduce content persistence, embeddings, a vector database, or new tables in this release.
 
 ## Decisions and scope
 
@@ -18,20 +20,20 @@ This is a standalone replacement design, not a migration or an implementation. T
 - **Subscription fetching:** Discover, normalize identities, deduplicate within the request, exclude acknowledged identities, and fetch remaining content. Acknowledgments apply across all of an agent's subscriptions and direct requests.
 - **Representation:** Request raw or cleaned output. Either acknowledged representation counts as served for subscription and direct-request checks; different material content requests, such as transcript languages, remain different identities.
 - **Persistence:** Store subscriptions and attempt/receipt metadata only. No content archive, raw/processed tables, durable execution queue, or content sharing across agents.
-- **Delivery:** Serve one item at a time or bounded batches. Continue fetching subsequent batches only within bounded prefetch and per-agent memory budgets.
+- **Delivery:** Serve complete items one at a time or in bounded batches. Never chunk or truncate an individual item; return `item_too_large` if it cannot fit the applicable whole-item limits. Continue fetching subsequent batches only within bounded prefetch and per-agent memory budgets.
 - **Acknowledgment:** A durable ledger entry becomes suppression evidence only when acknowledged. Successful fetching, response preparation, delivery time, and errors alone do not suppress a later request.
 - **Errors:** Fetch/processing outcomes are inspectable diagnostics, not persistent retry eligibility. A new request for an unacknowledged item may try again after current authorization, target, capability, and resource checks.
 - **Execution:** One service owns shared bounded asyncio discovery and fetch queues, with independently configurable consumer concurrency. Cleaning is part of the fetch task, not a separate process or queue.
 
 Intended sources include Gmail, YouTube, X, and WhatsApp, subject to the capabilities of implemented adapters and authorized connections. Supporting an identity or raw byte representation does not promise an adapter for every source, private target, or large-media format.
 
-## What changes from 0.9
+## Scope exclusions and retained principles
 
-The durable `items`, `subscription_items`, `raw_payloads`, and `item_contents` archive model is removed. There are no current-content pointers, saved-input corrections, immutable published-result chains, content-search indexes, or saved-content retrieval snapshots. Previously archived data must not be deleted automatically as part of adopting this design.
+This release does not include durable `items`, `subscription_items`, `raw_payloads`, or `item_contents` archive tables. There are no current-content pointers, saved-input corrections, immutable published-result chains, content-search indexes, or saved-content retrieval snapshots. Any existing archived data must not be deleted automatically as part of adopting this design.
 
-Subscriptions now persist editable collection rules, rather than being a YAML-only identity registry. They no longer grant access to content. Connection grants define access, and runtime subscription edits apply to subsequent requests without an owner restart.
+Subscriptions persist editable collection rules, not a YAML-only identity registry. They do not grant access to content. Connection grants define access, and runtime subscription edits apply to subsequent requests without an owner restart.
 
-The durable fetch-failure counter and exhausted-allowance policy are superseded. Errors do not automatically block future requests; no old failure counter is migrated into retry eligibility. Acknowledgment-based deduplication replaces archive-based reuse: eligible fresh requests fetch upstream again, not from disk or another agent's memory.
+There is no durable fetch-failure counter or exhausted-allowance policy. Errors do not automatically block future requests, and persisted historical failure counts must not become retry eligibility. Use acknowledgment-based deduplication, not archive-based reuse: eligible fresh requests fetch upstream again, not from disk or another agent's memory.
 
 Retain the six-part canonical identity and SHA-256 collision checking. Retain local MCP/CLI communication, one service owner, disposable execution, explicit windows, structured adapters, and bounded async execution. No fallback extractor is introduced.
 
@@ -50,6 +52,8 @@ Owner connection/grant configuration initially remains restart-required. Restart
 ### Connections and upstream identity
 
 A connection is an authorized execution route with declared discovery/fetch capabilities, not an item-identity component. It may expose multiple selector types, but each subscription chooses exactly one. A connection's adapter may internally use different provider components; agents do not select arbitrary executables or credentials.
+
+The owner can grant one configured connection to several agents. Configuration, credential references, and connection-level concurrency/rate limits are shared; subscriptions, request state, content buffers, and acknowledgments remain agent-specific. An adapter may reuse or isolate client sessions as needed for safe concurrency without creating separate logical connections for each agent. A matching namespace never grants access to another connection.
 
 Resolve private namespaces from verified stable target account/mailbox/tenant identity and any required narrower boundary. Public content uses the canonical empty namespace where the adapter contract permits it; unresolved private identity is an error, never public. Verify the target on discovery and fetch, including after reauthentication.
 
@@ -78,7 +82,7 @@ Deleting a subscription does not delete ledger records, revoke a connection gran
 
 ### Pull-driven first version
 
-Use pull-driven collection initially: `fetch_new(subscription_id)` starts discovery/fetching. There is no automatic polling, startup scan, or prefetch merely because a subscription exists. This is the simplest proposed operating default for the non-archive service; scheduled collection is deferred rather than assumed from 0.9.
+Use pull-driven collection initially: `fetch_new(subscription_id)` starts discovery/fetching. There is no automatic polling, startup scan, or prefetch merely because a subscription exists. This is the simplest proposed operating default for the non-archive service; scheduled collection is deferred.
 
 Absent an explicit override, fix `until` to request admission time and `since` to `until - lookback`. An explicit timezone-aware window may replace those bounds. A wider window does not bypass acknowledgments unless the caller explicitly sets the repeat override.
 
@@ -146,9 +150,9 @@ One fetch task holds its concurrency slot while it:
 1. Revalidates authorization, target identity, capability, acknowledgment override, and resource limits.
 2. Fetches the complete required upstream response or bundle into bounded memory.
 3. Returns raw content or invokes a compatible parser for cleaned content using the requested identity/options as explicit context.
-4. Validates required output, records a terminal attempt outcome, and places deliverable content in the requesting agent's bounded buffer.
+4. Validates required output and whole-item serialized size, records a terminal attempt outcome, and places deliverable content in the requesting agent's bounded buffer.
 
-Raw output means adapter-defined payload representation, not authentication headers, transport credentials, or unrestricted diagnostic dumps. Define each adapter's raw packaging and media type. Binary/multipart delivery requires an explicit transport contract and size bounds; the first implementation may reject unsupported representations rather than silently truncate or write them to disk.
+Raw output means adapter-defined payload representation, not authentication headers, transport credentials, or unrestricted diagnostic dumps. Define each adapter's raw packaging and media type. Binary/multipart delivery requires an explicit transport contract and size bounds; the first implementation may reject unsupported representations rather than silently truncate or write them to disk. Upstream pagination or multipart assembly is allowed internally, but the requested item must be returned in one complete MCP response entry, never across content chunks.
 
 There is no separate processing queue/process, saved raw input, fallback extractor, durable raw/cleaned lifecycle, or correction operation. Cleaned requests fail explicitly when parsing/validation fails. Fast parsing can run inline; blocking SDKs or expensive synchronous preparation use bounded offloading and must respect shutdown. No content spool files or hidden disk cache are introduced.
 
@@ -178,7 +182,7 @@ references or normalize/dedup/receipt check
                                       |
                            agent-owned delivery buffers
                                       |
-                            MCP batches / continuation
+                         MCP whole-item batches / next batch
                                       |
                          acknowledgment -> durable ledger
 ```
@@ -195,15 +199,62 @@ One service process owns both stages, all runtime request state, and database ac
 
 A normal MCP wait timeout returns available batches or progress without immediately cancelling accepted background work. Idle expiration, explicit cancellation, client abandonment policy, and shutdown eventually release bounded runtime state. A new request for an unacknowledged item can fetch again; continuation of the same live request serves its buffered content without creating a new attempt.
 
-## Delivery, continuation, and acknowledgment
+## Whole-item delivery, batch continuation, and acknowledgment
 
 ### Batches
 
 Support `one_by_one` and `batch` delivery modes (proposed names). One-by-one caps each batch at one item; batch mode caps it at the connection's configured item count, also respecting byte/token limits. For multi-connection requests, keep batches connection-specific so limits remain unambiguous.
 
-Return an opaque runtime request/batch/cursor identity, item delivery IDs, bounded content, per-item outcomes, completion status, and continuation instructions. A delivery ID is the corresponding durable attempt ID, not merely an item key. Separate `discovery_complete`, pending fetch/preparation work, and buffered content availability; do not claim “no more items” before discovery and admitted fetching finish.
+Return structured JSON with an opaque request ID, item delivery IDs, complete content, and a next-batch cursor when work/results remain. A delivery ID is the corresponding durable attempt ID, not merely an item key. Keep discovery completion, pending fetch/preparation work, and buffered content availability distinct in request status; do not claim “no more items” before discovery and admitted fetching finish. Ordinary content responses need not repeat every progress field or expose a separate batch ID; a list of delivery IDs is sufficient to acknowledge a batch.
 
-Oversized items use explicit content continuation when supported, otherwise a size error. Only complete-item delivery is eligible for acknowledgment. Start serving ready batches while later pages/items are still being discovered/fetched; no global chronological ordering across unfinished scans is promised.
+Every successful item entry contains its full requested content. There is no per-item chunking, partial-content result, or content-continuation cursor. If several individually valid items exceed a batch's budget, return fewer whole items and defer the others to another batch. If one item cannot fit on its own within the configured payload, whole-item, or response-size limits, return an explicit `item_too_large` error for that item, without content or truncation. Leave its `delivery_time` and `acknowledgement_time` null, disallow acknowledgment, and continue with other eligible items.
+
+Enforce both bounded input acquisition and serialized output limits, including JSON/envelope or binary-encoding overhead. Start serving ready batches while later pages/items are still being discovered/fetched; no global chronological ordering across unfinished scans is promised.
+
+### Lean JSON response
+
+The following example is a batch from a request for cleaned YouTube transcript text. All entries in `items` contain complete content and require acknowledgment by contract; omit the nested `item` identity wrapper and the redundant `content_complete` and `acknowledgement_required` fields.
+
+```json
+{
+  "request_id": "req_123",
+  "items": [
+    {
+      "delivery_id": "delivery_456",
+      "source_id": "video_789",
+      "content": {
+        "text": "Welcome to today's discussion."
+      }
+    }
+  ],
+  "next_cursor": "cursor_abc"
+}
+```
+
+For an individual oversized result, return a per-item error rather than a partial item. Successful peers may still appear in the same response's `items` array; this example has none.
+
+```json
+{
+  "request_id": "req_124",
+  "items": [],
+  "errors": [
+    {
+      "source_id": "video_oversized",
+      "code": "item_too_large",
+      "message": "The complete item exceeds the configured size limit."
+    }
+  ],
+  "next_cursor": null
+}
+```
+
+- **Request context:** In a homogeneous request, inherit source, content kind/options, representation, and connection from the admitted request rather than echoing the full six-field identity on every item. `source_id` identifies the upstream object, and `delivery_id` identifies the specific attempt to acknowledge.
+- **Mixed requests:** A source ID alone may be ambiguous across namespaces, content kinds, or language options. Where needed, add a compact `request_ref` that resolves to the originating request/subscription input and its admitted content context; separate connection-specific batches as already required. Do not change the canonical internal/ledger identity just to simplify the response.
+- **Continuation:** `next_cursor` means continue this request for further whole-item batches or progress, not retrieve the rest of an item. It is null only after collection has terminated and no further result entries remain; null alone does not certify successful upstream coverage. An empty batch with a live cursor can mean work is still pending. Request status and structured errors report partial/failed discovery.
+- **Acknowledgment:** Every entry in `items` requires explicit acknowledgment; error/skip notices and discovery references do not. An empty `errors` array may be omitted. A failed attempt's diagnostic ID, if exposed for inspection, does not make it acknowledgeable.
+- **Content shape:** `content` remains source-specific structured output. Transcript timestamps such as `start_seconds` are content features, not mandatory delivery metadata; return plain transcript text when that is the requested output. If timestamp inclusion changes the requested content contract, normalize that choice in material options. Raw JSON or text stays inside the same outer response with appropriate representation/media-type information where needed.
+
+Exact field spellings are proposed, but whole-item delivery, explicit per-item errors, omission of the redundant wrapper/flags, and unambiguous result-to-request correlation are required. No internal content-result or future storage contract has to mirror this lean public response.
 
 ### Acknowledgment semantics
 
@@ -211,11 +262,11 @@ An agent acknowledges completed delivery IDs, individually or as an explicit lis
 
 Update the ledger transactionally before reporting acknowledgment success and then release acknowledged content. If the database write fails, report failure and do not treat the item as acknowledged; the agent can retry. A lost acknowledgment response is safe to retry by delivery ID.
 
-An acknowledgment is an explicit caller declaration, not proof the model read or understood content. Do not mark discovery, fetching, the first chunk, or mere timeout as acknowledgment.
+An acknowledgment is an explicit caller declaration, not proof the model read or understood content. Do not mark discovery, fetching, response preparation, an oversized-item error, or mere timeout as acknowledgment.
 
 ### Delivery timestamp and restart
 
-`delivery_time` records the server's complete-delivery handoff attempt, not proof of receipt. Persist it immediately before the final response/chunk handoff so an immediate acknowledgment can be validated. Database writes and network delivery cannot be one atomic transaction: a failed handoff may leave a delivery timestamp, but without acknowledgment it does not suppress redelivery.
+`delivery_time` records the server's complete-delivery handoff attempt, not proof of receipt. Persist it for successful item entries immediately before handing off the response containing those complete items so an immediate acknowledgment can be validated. Do not set it for error entries. Database writes and network delivery cannot be one atomic transaction: a failed handoff may leave a delivery timestamp, but without acknowledgment it does not suppress redelivery.
 
 Durable delivery IDs allow late acknowledgment after service restart or runtime-buffer expiration if the complete-delivery record remains and the agent is still authorized. Old batch cursors cannot resume after restart; the caller must acknowledge known delivery IDs directly or start a new request. If the record has been purged, return an explicit expired/unknown-delivery result and do not reconstruct acknowledgment state.
 
@@ -242,6 +293,8 @@ If several subscription inputs discover the same item within one request, use th
 
 Only successful fetch/preparation can acquire `delivery_time`, and acknowledgment requires that timestamp. `fetching_status=fetched` alone does not imply clean output or delivery. Raw deliveries normally have no processing error; transport-preparation errors remain distinguishable from upstream fetch failure.
 
+Record `item_too_large` at the stage that detects it: exceeding acquisition limits before a complete upstream fetch is a fetch error; failing whole-item output/serialization limits after a successful fetch is a preparation error with `fetching_status=fetched`. Complete size validation before persisting the terminal attempt outcome; do not insert a successful outcome and later mutate its immutable error classification during batching. Either error leaves delivery and acknowledgment unset. Rebatching individually valid items is not an item-size error.
+
 Permanent-looking errors, authentication failures, rate limits, and processing failures are visible but do not create durable “never retry” flags or failure counters. Current permission/account verification and capability validation still apply. Connection pacing and bounded request-local transient retries may be configured; they are runtime controls, not ledger-driven eligibility. Specific retry defaults remain implementation choices.
 
 There are no ledger rows for standalone discovery results, acknowledged-item skips, or pre-admission permission/validation rejections. Report those in the current response/runtime status. Partial/cancelled network attempts need not become synthetic durable work records.
@@ -261,6 +314,46 @@ Base acknowledged-row retention on `acknowledgement_time`, not upstream publicat
 A month of receipts for a week-long lookback is a reasonable configurable example, not proof of permanent deduplication safety or an approved universal default. Wider windows, changed selectors, and resurfaced upstream content can produce repeats after purge. Because receipts are agent-wide, do not delete them based only on one subscription's lookback or deletion.
 
 Initially expose purge as an owner operation with explicit scope, cutoff, dry-run counts, and confirmation. Serialize purge with acknowledgment and protect active deliveries from cleanup while they are live; after buffer expiry, late acknowledgment remains possible only while its row remains. No autonomous agent deletion of ledger evidence is required by this checkpoint.
+
+## Future content store and semantic-search extension
+
+This section defines extension boundaries, not features to implement in 1.1. The current service continues to store only subscriptions and delivery metadata; no archive tables, stored content versions, embeddings, vector database, indexing worker, or durable indexing queue is introduced.
+
+### Shared internal content-result contract
+
+Fetch/preparation should return a typed, transport-independent content result. It carries the complete canonical item identity/key, requested representation, payload/media type, actual fetch time, and relevant source/provider/parser provenance. Parser provenance applies only when parsing occurred. Keep credential/session material out of this object; it is not a transport-debug dump.
+
+Delivery consumes this result instead of reaching into provider-specific responses. Keep the internal result distinct from the lean MCP response: public field omission must not discard identity or provenance that internal consumers need. Its fields are runtime data in this release, not new ledger columns.
+
+An optional future content store can consume the same result without changing adapters or embedding persistence into the delivery service. Keep a clear function/type boundary; do not build a speculative event bus, plugin framework, or unbounded fan-out pipeline now.
+
+### Separate delivery and storage ownership
+
+Delivery owns temporary agent/request buffers, batch continuation, acknowledgments, and their memory limits. A future store owns retained copies, storage permissions, retention, and deletion. Acknowledgment releases delivery-owned memory; it must not implicitly delete an archived copy or make the delivery service responsible for archive retention.
+
+Future archive retrieval must be an explicit operation with defined receipt behavior. Do not silently change direct fetching or `allow_repeat=true` into a cache lookup: an explicit repeated upstream fetch must still fetch fresh content. Adding a store must not implicitly enable cross-agent sharing.
+
+### Logical items versus stored versions
+
+Retain the existing `item_key` as the identity of the requested object, independent of delivery attempts or storage locations. A future store needs a separate stored-result/version ID because repeated fetching can observe an edited post, changed transcript, different raw/cleaned representation, or changed parser output under the same logical identity.
+
+A future stored version should retain its item identity, representation, fetch/provenance metadata, and content checksum. A checksum describes bytes or a defined canonical representation, not account permission or logical identity; do not silently merge versions merely because item keys match. Distinguish stored-result IDs from attempt/delivery IDs, and do not require a retained ledger row to keep an archive object identifiable.
+
+### Semantic index as a derived capability
+
+Treat semantic search as an optional index over retained searchable content, not as the delivery ledger or the sole source of permission decisions. Preserve a reference from every index entry to a specific stored-result version, so search hits resolve to the content actually indexed.
+
+- **Index metadata:** Track stored-result ID, item key, text-segment identity, and the versions of the text extraction/segmentation and embedding models. Define replacement/reindexing behavior so stale versions do not silently appear current.
+- **Index segments versus delivery:** Internal text segmentation for embeddings is unrelated to MCP delivery. It does not introduce per-item response chunking; whole-item delivery and explicit oversized-item errors remain the public contract unless separately revised.
+- **Authorization:** Keep sufficient owner/connection and verified upstream provenance to recheck current access. Restrict candidates to the caller's authorized scope and validate access before exposing text, snippets, or source metadata; neither a vector match, namespace match, nor knowledge of a stored ID grants access.
+- **Deletion and revocation:** Archive deletion must remove or invalidate derived search entries, and read-time checks must prevent stale index entries from revealing deleted or newly unauthorized content. Rebuild the index from retained content rather than treating embeddings as the only recoverable record.
+- **Independent retention:** Purging delivery receipts permits redelivery; it must not accidentally delete archive objects or embeddings. Conversely, deleting archived content must not silently rewrite acknowledgment history. Any combined purge needs explicit scope.
+
+### Explicit durable handoff when storage is added
+
+Do not enqueue a memory-only indexing task, free the only payload after acknowledgment, and assume indexing will eventually succeed. A future persistence/indexing feature must define the durable handoff: for example, confirm a stored copy before releasing storage-owned input, then index from that copy with bounded retry/recovery.
+
+That future feature must explicitly choose whether delivery waits for storage, how storage failure is reported, and how indexing is resumed or rebuilt. Recovery machinery belongs to the optional storage/indexing capability, not implicitly to all retrieval requests. Without that feature enabled, 1.1 keeps the existing disposable execution and memory-only content behavior.
 
 ## Proposed interfaces
 
@@ -303,13 +396,14 @@ The database must contain no payload/blob, cleaned content, discovery-page dump,
 
 ### Shutdown
 
-Retain the earlier best-effort shutdown policy, adjusted for nonpersistent content: interactive shutdown may drain accepted work or discard it; OS shutdown uses a configurable total grace period, previously agreed default 15 seconds. Stop new roots, allow accepted queued/in-flight discovery/fetch follow-up to drain only within the deadline and memory limits, and never wait indefinitely for agent acknowledgment.
+Use best-effort shutdown for nonpersistent content: interactive shutdown may drain accepted work or discard it; OS shutdown uses a configurable total grace period, default 15 seconds. Stop new roots, allow accepted queued/in-flight discovery/fetch follow-up to drain only within the deadline and memory limits, and never wait indefinitely for agent acknowledgment.
 
 Accept acknowledgments for already delivered items while shutdown can safely commit them. At exit discard all remaining content and runtime work; no acknowledgment is synthesized for undelivered/unacknowledged buffers. Committed ledger/subscription data survives; duplicate network work after restart is accepted. Blocking offloads must not keep the process alive beyond the shutdown budget.
 
 ## Acceptance tests
 
 - **Agent isolation:** Reject forged agent, subscription, delivery, and cursor ownership; filter ledger results and connection capabilities by current grants. Never reuse one agent's content buffers for another.
+- **Shared connections:** Several granted agents may use one connection definition and credential reference while sharing its concurrency/rate budget. Subscriptions, buffers, and acknowledgment history stay agent-specific; a namespace match never grants another route.
 - **Connection validation:** Unknown/mismatched private targets fail closed; connection rename/credential rotation preserves identity, and unrelated account reassignment cannot silently inherit a connection ID.
 - **Subscription shape:** Accept supported multi-channel or multi-playlist arguments but reject mixed selector types in one subscription; enforce shared content/options/lookback and owner-only mutation.
 - **Runtime edits:** Existing requests keep their admitted snapshots, new requests use edits, and deletion preserves receipts without granting access or implicitly cancelling work.
@@ -319,8 +413,10 @@ Accept acknowledgments for already delivered items while shutdown can safely com
 - **Direct override:** A normal repeat returns `already_served` without fetching; `allow_repeat=true` performs a fresh fetch and creates a new attempt even for identical representation.
 - **Unacknowledged retries:** Fetch errors, processing errors, and delivered-but-unacknowledged attempts do not suppress a fresh request. Forced failure never erases a prior successful acknowledgment.
 - **Ledger outcomes:** Fetch success plus processing failure remains distinguishable; delivery/ack fields stay null for failed results. No body, raw bytes, credential, or durable queue state enters the DB.
-- **Progressive batches:** Enforce connection item caps and response-byte caps; begin delivering before entire discovery finishes, and report continuation/completion accurately.
-- **Large items:** Complete all content chunks before enabling acknowledgment. Unsupported oversized/raw-binary delivery fails explicitly rather than truncating.
+- **Progressive batches:** Enforce connection item caps and response-byte caps; begin delivering before entire discovery finishes, and report continuation/completion accurately. Split collections into batches of whole items, never split an individual item's content.
+- **Lean responses:** Successful entries omit `item`, `content_complete`, and `acknowledgement_required`; preserve unambiguous source/request correlation and delivery IDs. A live cursor may accompany an empty pending batch; null does not turn partial/failed discovery into successful coverage.
+- **Large items:** Return `item_too_large` for a single item exceeding acquisition or complete-output limits, accounting for serialization overhead. Do not truncate, deliver fragments, set delivery/acknowledgment time, or block successful peer items. If only the aggregate batch is too large, defer complete items instead of marking them oversized.
+- **Size outcome classification:** Detect size failure before terminal outcome insertion. Distinguish fetch-stage size errors from post-fetch preparation errors and preserve retry eligibility without requiring a schema change.
 - **Acknowledgment:** Enforce ownership and complete delivery, commit before reporting success, preserve first acknowledgment time, and handle repeated or lost-response acknowledgment safely.
 - **Crash windows:** A crash before outcome commit may leave no row; a lost content response with a delivery timestamp but no acknowledgment remains retryable. Restart never rebuilds jobs.
 - **Restart receipts:** Known fully delivered IDs can be acknowledged after restart while retained; old runtime cursors expire; purged IDs fail explicitly.
@@ -328,11 +424,12 @@ Accept acknowledgments for already delivered items while shutdown can safely com
 - **Concurrency:** Independent discovery and fetch limits work above one; per-connection pacing is respected and database sessions are not shared unsafely.
 - **Retention:** Expire receipts by acknowledgment age, not publication age. Purge enables redelivery intentionally, respects live deliveries, and does not use one subscription's lookback as an agent-wide retention rule.
 - **Shutdown:** Drain accepted work only within the deadline, never fabricate acknowledgments, release content, preserve committed metadata, and avoid indefinite offload waits.
+- **Extension boundary:** Fetch/preparation returns an internal typed content result consumed by delivery without provider-specific lookups. Verify identity/provenance survives public-response projection while no archive, embedding, vector index, or background persistence is enabled. Future search text segmentation is not a license for per-item MCP chunking.
 
 ## Remaining implementation choices
 
-No unresolved product-policy conflict blocks this checkpoint. The important choices before implementation are the first adapter/content combinations, stable account-namespace resolution, exact MCP schemas, canonical JSON test vectors, local IPC and shutdown mechanism, retry/timeouts, payload/batch/queue/memory limits, receipt retention, and raw binary/chunk transport.
+No unresolved product-policy conflict blocks this checkpoint. The important choices before implementation are the first adapter/content combinations, stable account-namespace resolution, exact MCP schemas, canonical JSON test vectors, local IPC and shutdown mechanism, retry/timeouts, payload/batch/queue/memory limits, receipt retention, and supported whole-item raw binary transport. Per-item chunking is excluded, not an open transport choice.
 
 Pull-driven collection, owner-file grants, two-table placement, owner-only purge, and concrete interface spellings are explicit implementation recommendations, not separate user-approved numeric defaults. Validate them during implementation without silently restoring archive semantics or treating examples as deployed capabilities.
 
-Begin with a fake adapter, two agents, editable subscriptions, the two-table ledger, acknowledgment/override tests, and bounded shared queues. Then implement one real discovery/fetch path and progressive delivery. Preserve checkpoints 0.1 through 0.9; adoption of 1.0 requires a separate reviewed migration/export decision if older implementations contain data.
+Begin with a fake adapter, two agents, editable subscriptions, the two-table ledger, acknowledgment/override tests, and bounded shared queues. Then implement one real discovery/fetch path and progressive whole-item delivery. Preserve checkpoint 1.0 unchanged. The two persistent tables and their columns/indexes are unchanged by 1.1; adopting this design must not silently delete existing data, and any necessary migration/export requires a separate reviewed decision.
