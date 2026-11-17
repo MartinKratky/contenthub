@@ -25,7 +25,7 @@ Checkpoint 1.1 adds lean JSON response examples, requires whole-item delivery wi
 - **Errors:** Fetch/processing outcomes are inspectable diagnostics, not persistent retry eligibility. A new request for an unacknowledged item may try again after current authorization, target, capability, and resource checks.
 - **Execution:** One service owns shared bounded asyncio discovery and fetch queues, with independently configurable consumer concurrency. Cleaning is part of the fetch task, not a separate process or queue.
 
-Intended sources include Gmail, YouTube, X, and WhatsApp, subject to the capabilities of implemented adapters and authorized connections. Supporting an identity or raw byte representation does not promise an adapter for every source, private target, or large-media format.
+The first implementation target is public YouTube discovery and transcript fetching, using the three libraries specified below. Gmail, X, and WhatsApp remain future sources. Supporting an identity or raw byte representation does not promise an adapter for every source, private target, or large-media format.
 
 ## Scope exclusions and retained principles
 
@@ -36,6 +36,93 @@ Subscriptions persist editable collection rules, not a YAML-only identity regist
 There is no durable fetch-failure counter or exhausted-allowance policy. Errors do not automatically block future requests, and persisted historical failure counts must not become retry eligibility. Use acknowledgment-based deduplication, not archive-based reuse: eligible fresh requests fetch upstream again, not from disk or another agent's memory.
 
 Retain the six-part canonical identity and SHA-256 collision checking. Retain local MCP/CLI communication, one service owner, disposable execution, explicit windows, structured adapters, and bounded async execution. No fallback extractor is introduced.
+
+## First connection: YouTube
+
+Implement one logical YouTube connection with two alternative discovery backends and one transcript-fetch backend. The owner may grant that connection to multiple agents; backend choice changes execution, not namespace, item identity, acknowledgment scope, or the subscription's one-selector rule.
+
+The agreed library choices are `yt-dlp` for discovery without configured credentials, `google-api-python-client` for API-key-based discovery, and `youtube_transcript_api` for fetching transcripts. Backend defaults and configuration spellings below are implementation recommendations, not a requirement to introduce additional persistent entities.
+
+### Backend roles and prerequisites
+
+| Role | Library and adapter key | Initial use |
+|---|---|---|
+| Discovery without credentials | `yt-dlp`, imported as `yt_dlp`; key `yt_dlp` | Embed `YoutubeDL` in Python for metadata discovery, not media downloading; the documented extraction API supports `extract_info(..., download=False)` ([yt-dlp embedding documentation](https://github.com/yt-dlp/yt-dlp/tree/master)). |
+| API-key discovery | `google-api-python-client`, imported as `googleapiclient`; key `google_api` | Use YouTube Data API v3 with a secret-resolved API key passed as `developerKey`; the Google client documents this key-based construction for public-data access ([API-key guide](https://googleapis.github.io/google-api-python-client/docs/api-keys.html)). |
+| Transcript fetching | Distribution `youtube-transcript-api`, imported as `youtube_transcript_api`; key `youtube_transcript_api` | Use `YouTubeTranscriptApi().fetch(video_id, languages=[language])`; the project documents keyless transcript access, exact-language lists, and a `FetchedTranscript` result ([library documentation](https://github.com/jdepoix/youtube-transcript-api)). |
+
+For `yt_dlp`, the product requirement is public discovery with no configured API key, OAuth flow, browser-cookie import, or login. Do not reinterpret “no credentials” as a guarantee of zero runtime dependencies: yt-dlp documents additional components for full YouTube support and warns that flat-playlist metadata can be incomplete or approximate ([yt-dlp documentation](https://github.com/yt-dlp/yt-dlp/tree/master)). Pin and smoke-test a supported metadata-only configuration; report unmet dependencies or access blocks instead of silently importing user cookies or enabling a paid service.
+
+For Google discovery, the owner must configure a Google Cloud API key with YouTube Data API enabled, and requests are subject to the project's quota ([YouTube Data API setup and quota documentation](https://developers.google.com/youtube/data/getting-started)). An API key is not authorization to read private user data; Google's client documentation distinguishes that from OAuth-based access ([API-key guide](https://googleapis.github.io/google-api-python-client/docs/api-keys.html)). Keep private/account-authenticated YouTube access out of this first connection contract.
+
+The transcript library documents `RequestBlocked`/`IpBlocked` failures, including cloud-hosting limitations, and warns that its undocumented upstream interface can change ([youtube-transcript-api documentation](https://github.com/jdepoix/youtube-transcript-api)). Treat these as explicit runtime failures, not evidence that captions are absent; no proxy purchase, provider substitution, cookie import, or fallback extractor is automatic.
+
+### Selection and owner configuration
+
+Use `yt_dlp` as the proposed default discovery backend. Enable `google_api` only when the owner configures its credential reference; lack of that optional key must not disable keyless discovery or direct transcript fetching. Capability inspection reports each method's availability separately.
+
+Proposed owner configuration shape:
+
+```yaml
+connections:
+  youtube:
+    id: "2c68e931-7f3a-4da0-8aa6-fda853d8a7e4"
+    provider: youtube
+    discovery:
+      default_method: yt_dlp
+      methods:
+        yt_dlp: {}
+        google_api:
+          api_key_ref: contenthub/youtube_data_api
+    fetch:
+      method: youtube_transcript_api
+```
+
+This is an illustrative credential reference, not an API key. Omit the `google_api` entry for a keyless configuration; never put the key value into subscription JSON, responses, identity options, or the ledger. Missing/invalid configured credentials make that method unavailable and produce a clear error when selected.
+
+Expose an optional `discovery_method` argument on standalone discovery and subscription-fetch requests. A request may select only owner-enabled methods; omission uses the connection default, snapshotted on admission. Do not automatically run both methods or fail over between them. If a caller explicitly retries with the other backend, retain the same item identity and receipt checks.
+
+A subscription still stores one connection and one selector type; the backend is execution routing, not a selector or material content option. Initially use the connection default or an explicit per-request override rather than adding a subscription column for backend preference. Exact API names remain proposed; this routing recommendation preserves the two-table schema.
+
+### Shared selectors, identities, and date windows
+
+Implement both discovery backends behind the same `youtube_channels` and `youtube_playlists` selector contracts. Accept one or more canonical channel IDs or playlist IDs respectively, not a mixed list; URL/handle convenience resolution can be added only with validation and explicit target normalization. The initial fetch capability is `content_kind=transcript`, not video/audio downloads, comments, or general YouTube search.
+
+Normalize discovered objects to `source=youtube`, `upstream_kind=video`, `namespace=""`, and `source_id=<video_id>`. Channel IDs, playlist IDs, playlist-entry IDs, discovery backend, and API key do not become item identity. Raw/cleaned transcript output continues to share one identity; requested language remains a material option.
+
+Use video publication time for the requested window, not the time a video was added to a playlist. Google's playlist-item resource distinguishes `snippet.publishedAt` (playlist insertion) from `contentDetails.videoPublishedAt` (video publication), and distinguishes playlist-item IDs from video IDs ([playlistItems reference](https://developers.google.com/resources/api-libraries/documentation/youtube/v3/python/latest/youtube_v3.playlistItems.html)). The adapters must normalize that distinction and apply `since <= published_at < until` when sufficiently precise metadata is available.
+
+Do not invent exact timestamps from date-only or approximate values. Enrich metadata through the selected backend where possible; otherwise report unresolved coverage and omit ambiguous candidates from strict-window fetch admission, rather than silently asserting a complete scan. Do not assume playlists are sorted by publication date or stop at the first old entry; scan within configured bounds and report partial coverage when a bound or upstream failure stops the scan.
+
+### Discovery backend implementation
+
+- **`yt_dlp`:** Use the Python library, not shell command construction. Start with flat/lazy metadata extraction; the library documents `extract_flat`, `lazy_playlist`, `skip_download`, `socket_timeout`, and `cachedir=False` for relevant behavior ([YoutubeDL Python parameter definitions](https://github.com/yt-dlp/yt-dlp/blob/master/yt_dlp/YoutubeDL.py)). Disable media/subtitle/thumbnail/info-file writes, download archives, filesystem cache, and automatic browser-cookie loading. Keep lazy enumeration and any per-video metadata enrichment inside bounded discovery execution, not on the event loop.
+- **Metadata precision:** Flat-playlist extraction can omit fields, and yt-dlp's `approximate_date` option may make date filters inaccurate ([yt-dlp documentation](https://github.com/yt-dlp/yt-dlp/tree/master)). Do not treat flat IDs alone or approximate dates as proof of exact-window coverage; exercise the enrichment/partial-coverage rule above.
+- **`google_api`:** For a channel, obtain `contentDetails.relatedPlaylists.uploads` through `channels.list`, then enumerate that playlist using `playlistItems.list`; this is Google's documented channel-upload discovery flow ([YouTube implementation guide](https://developers.google.com/youtube/data/guides/implementation/videos)). For a playlist selector, enumerate its supplied playlist ID directly and follow `nextPageToken`; that pagination and the video-ID/publication fields are documented in the [playlistItems reference](https://developers.google.com/resources/api-libraries/documentation/youtube/v3/python/latest/youtube_v3.playlistItems.html). Do not use the playlist-entry ID as the video ID.
+- **Bounds and errors:** Bound upstream pages, metadata enrichments, total candidate IDs, and timeouts for both methods. Respect connection pacing and Google quota failures; do not silently switch to the other method or create transcript-delivery attempts merely because discovery failed.
+
+### Transcript fetching and representation
+
+Normalize requested language explicitly and pass exactly that language rather than a fallback-language list. The library's documented default prefers a manual transcript over an automatically generated transcript when both exist in the requested language ([transcript selection documentation](https://github.com/jdepoix/youtube-transcript-api)). Use that as the proposed initial track-selection policy, disclose the actual track provenance, and do not translate or substitute a different language automatically. A future caller-selectable track policy must be normalized as a material identity option.
+
+The library returns transcript snippets and provides `to_raw_data()` with `text`, `start`, and `duration`, alongside video/language/generated-track metadata on the fetched result ([transcript result documentation](https://github.com/jdepoix/youtube-transcript-api)). For this connection, define:
+
+- **Raw:** The complete library-exposed snippet list plus relevant transcript metadata, serialized as JSON without application-level text cleaning. “Raw” means this adapter result, not original HTTP/XML bytes; never include authentication or transport diagnostics.
+- **Cleaned:** Complete transcript text in the lean response's `content.text`, with deterministic formatting/whitespace cleanup and no summarization or omitted speech. Retain relevant actual language/track provenance internally; expose it where needed without restoring the full `item` wrapper or redundant delivery flags.
+- **Delivery:** No per-item chunking. Apply the same serialized-size limits and `item_too_large` behavior to either representation; an error does not count as delivery or acknowledgment.
+- **Direct requests:** Accept a validated video ID even if it was not discovered through a subscription. Apply the agent's connection grant and retained acknowledgment check before transcript fetching, with explicit `allow_repeat` behavior unchanged.
+
+Keep exact language required by the content request, with English only as an illustrative normalized default. Raw/cleaned is not part of identity. If explicit timestamp-preserving cleaned output is added, define and normalize that option rather than silently changing the requested output.
+
+### Async integration and first-connection acceptance
+
+Run these library interactions through bounded offloading under the existing discovery/fetch limits; no additional processing queue or standalone service is introduced. Set provider timeouts and retry bounds explicitly, avoid sharing mutable client sessions across concurrent calls unless supported, and test shutdown when an upstream call stalls.
+
+The Google client specifically warns that its `httplib2.Http()` objects are not thread-safe and requires a separate transport per requesting thread ([Google client thread-safety documentation](https://googleapis.github.io/google-api-python-client/docs/thread_safety.html)). Client isolation is an implementation detail; logical connection grants and per-connection quotas remain shared.
+
+Acceptance requires both discovery implementations to pass deterministic adapter fixtures and owner-run live smoke tests, plus transcript fetching in raw and cleaned modes. Include multi-target channels/playlists, overlapping discoveries, video-versus-playlist dates, missing dates, unavailable videos/transcripts, exact-language failure, blocked requests, Google key/quota errors, whole-item size errors, shared-connection agent isolation, acknowledgment suppression, and forced repeats.
+
+Pin tested library versions during implementation and document tested runtime prerequisites rather than relying on unbounded dependency upgrades. These notes verify documentation only: no API credentials have been configured, provider packages installed, or live discovery/fetch requests tested as part of this checkpoint amendment.
 
 ## Authorization and owner configuration
 
@@ -72,7 +159,7 @@ Examples of single-selector subscriptions are:
 | Gmail query | One query matching several senders/labels | Message body, cleaned, seven-day lookback |
 | X timelines | Several supported timeline targets | Post content, raw, configured lookback |
 
-These are illustrative selector names and values, not promises of implemented provider support. Different selector types, connections, content options, representations, or lookbacks require separate subscriptions.
+The YouTube channel/playlist selectors are the initial implementation targets described above; other sources remain illustrative and deferred. None of the examples claims already implemented provider support. Different selector types, connections, content options, representations, or lookbacks require separate subscriptions.
 
 ### Editing and lifecycle
 
@@ -363,9 +450,11 @@ Exact names and argument shapes are implementation proposals. The behavioral sep
 list_connections()
 get_connection_capabilities(connection_id)
 
-discover(connection_id, selector_type, selector, since, until, cursor?)
+discover(connection_id, selector_type, selector, since, until, cursor?,
+         discovery_method?)
 fetch_items(connection_id, items, representation, delivery_mode, allow_repeat=false)
-fetch_new(subscription_ids, window_override?, delivery_mode, allow_repeat=false)
+fetch_new(subscription_ids, window_override?, delivery_mode, allow_repeat=false,
+          discovery_method?)
 get_request_status(request_id)
 continue_delivery(cursor)
 acknowledge(delivery_ids)
@@ -381,6 +470,8 @@ list_delivery_attempts(filters, cursor?, limit?)
 ```
 
 Provider-specific discovery methods may wrap the typed discovery contract. Clients cannot choose executables, filesystem paths, unrestricted network destinations, credentials, or another agent identity. Full payloads are treated as untrusted evidence, not instructions.
+
+`discovery_method` is an optional execution-routing choice among owner-enabled connection backends, not an item option. For a multi-connection subscription request, apply an override only when every involved connection advertises it, otherwise reject before starting work; the first YouTube connection supports the two method keys specified above subject to key availability. Continuation inherits the admitted method and cannot switch it mid-request.
 
 Proposed owner CLI functions cover configuration validation, worker/MCP startup, connection authentication, status, ledger inspection/purge, and metadata backup. There is no archive search, correction/reprocessing-from-disk command, durable-job resume, or mandatory standalone backfill command. Historical collection uses explicit discovery/subscription windows or direct identities.
 
@@ -405,6 +496,7 @@ Accept acknowledgments for already delivered items while shutdown can safely com
 - **Agent isolation:** Reject forged agent, subscription, delivery, and cursor ownership; filter ledger results and connection capabilities by current grants. Never reuse one agent's content buffers for another.
 - **Shared connections:** Several granted agents may use one connection definition and credential reference while sharing its concurrency/rate budget. Subscriptions, buffers, and acknowledgment history stay agent-specific; a namespace match never grants another route.
 - **Connection validation:** Unknown/mismatched private targets fail closed; connection rename/credential rotation preserves identity, and unrelated account reassignment cannot silently inherit a connection ID.
+- **First YouTube connection:** Implement `yt_dlp` and `google_api` discovery with `youtube_transcript_api` fetching. Both discovery routes normalize the same public video/transcript identity; Google key absence does not break the keyless route, and neither route silently falls back to the other. Verify exact-language, date-window, raw/cleaned, blocked/quota-error, and whole-item delivery behavior.
 - **Subscription shape:** Accept supported multi-channel or multi-playlist arguments but reject mixed selector types in one subscription; enforce shared content/options/lookback and owner-only mutation.
 - **Runtime edits:** Existing requests keep their admitted snapshots, new requests use edits, and deletion preserves receipts without granting access or implicitly cancelling work.
 - **Identity:** Equivalent routes/selectors/options normalize to one key; different languages or private namespaces remain distinct. Raw/cleaned share a key. Hash collisions raise an integrity error.
@@ -428,8 +520,8 @@ Accept acknowledgments for already delivered items while shutdown can safely com
 
 ## Remaining implementation choices
 
-No unresolved product-policy conflict blocks this checkpoint. The important choices before implementation are the first adapter/content combinations, stable account-namespace resolution, exact MCP schemas, canonical JSON test vectors, local IPC and shutdown mechanism, retry/timeouts, payload/batch/queue/memory limits, receipt retention, and supported whole-item raw binary transport. Per-item chunking is excluded, not an open transport choice.
+The initial source/library scope is now specified: public YouTube channel/playlist discovery through `yt_dlp` or `google_api`, with transcripts fetched through `youtube_transcript_api`. Remaining implementation choices include tested dependency versions and runtime prerequisites, exact MCP/config schemas, canonical JSON test vectors, local IPC and shutdown mechanism, retry/timeouts, payload/batch/queue/memory limits, and receipt retention. Private-source namespace resolution and binary media delivery belong to later adapters; per-item chunking remains excluded.
 
 Pull-driven collection, owner-file grants, two-table placement, owner-only purge, and concrete interface spellings are explicit implementation recommendations, not separate user-approved numeric defaults. Validate them during implementation without silently restoring archive semantics or treating examples as deployed capabilities.
 
-Begin with a fake adapter, two agents, editable subscriptions, the two-table ledger, acknowledgment/override tests, and bounded shared queues. Then implement one real discovery/fetch path and progressive whole-item delivery. Preserve checkpoint 1.0 unchanged. The two persistent tables and their columns/indexes are unchanged by 1.1; adopting this design must not silently delete existing data, and any necessary migration/export requires a separate reviewed decision.
+Begin with a fake adapter, two agents, editable subscriptions, the two-table ledger, acknowledgment/override tests, and bounded shared queues. Then implement both YouTube discovery backends, the common transcript fetcher, and progressive whole-item delivery. Preserve checkpoint 1.0 unchanged. The two persistent tables and their columns/indexes are unchanged by 1.1; adopting this design must not silently delete existing data, and any necessary migration/export requires a separate reviewed decision.

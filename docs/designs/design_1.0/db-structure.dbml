@@ -45,6 +45,17 @@ Project contenthub {
     independent of delivery IDs; storage handoff/durability needs explicit design.
     Tables, columns, and indexes remain structurally identical to 1.0.
 
+    First connection target: public YouTube channels/playlists, using either
+    yt_dlp or google_api discovery and youtube_transcript_api transcript fetching.
+    Backend configuration and optional per-request discovery_method stay outside
+    subscriptions/item identity; no new backend table or subscription column.
+    The selected discovery method is runtime request context, not stored work.
+    Both routes normalize public namespace '' and upstream_kind=video;
+    content_kind=transcript and exact language options define requested content.
+    The Google credential reference remains owner configuration, never this DB.
+    Raw transcript delivery means the library-exposed result, not a saved HTTP
+    response. Whole-item delivery and agent-wide receipt checks are unchanged.
+
     UTC timestamps, application-generated UUID strings, and SQLite metadata
     storage are proposed initially. DBML notes require implementation checks;
     compiling this schema does not validate authorization or runtime semantics.
