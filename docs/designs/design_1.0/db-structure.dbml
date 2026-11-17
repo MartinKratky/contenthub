@@ -5,6 +5,21 @@ Project contenthub {
     Standalone checkpoint, not an executable migration.
     Existing data must not be deleted automatically.
 
+    Initial target OS is macOS, running as the owner's normal logged-in user.
+    Credential values live in native macOS Keychain, not this database or YAML.
+    Owner configuration holds only references. Owner CLI handles hidden API-key
+    entry and future supported browser OAuth login; agent MCP never receives
+    secrets or changes credential grants. No authentication/token tables added.
+    Credential rotation/refresh is distinct from restart-required config changes.
+    Unified owner entry point: contenthub auth <connection_id> [--method <method>].
+    Resolve a stable connection UUID or unique configured alias, not a provider
+    type. Multiple YouTube instances may have independent credential references.
+    The method declares API-key, OAuth, or no-auth behavior. Omitted method
+    selects the sole configured authentication-requiring method, regardless of
+    discovery default or missing credentials; ambiguity requires owner choice.
+    Resolve aliases before persisting IDs. Auth never changes grants or enables
+    methods, and no alias/authentication columns are added to these tables.
+
     Two tables: subscriptions and delivery_attempts.
     No persisted content, raw payloads, cleaned results, item registry,
     memberships, content corrections, durable queues, cursors, or run recovery.

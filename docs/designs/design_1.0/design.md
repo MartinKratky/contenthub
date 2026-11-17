@@ -1,11 +1,13 @@
 # ContentHub: Design checkpoint 1.1
 
 Version: 1.1\
-Status: Agreed product direction; concrete interface spellings and operating defaults proposed below\
+Status: Agreed product direction and unified owner-auth command; other interface spellings and operating defaults proposed below\
 Predecessor: `designs/design_1.0`, preserved unchanged\
 Working name: `contenthub`
 
 ContentHub is a local, connection-authorized content retrieval service with per-agent acknowledged-delivery deduplication. It is not a content archive. Agents discover upstream objects, explicitly fetch content, manage their own subscriptions, and inspect their delivery ledger through MCP. Content exists only in bounded runtime memory; persistent records describe subscriptions and retrieval attempts, never payloads.
+
+The initial target operating system is macOS, running as the owner's normal logged-in user. API keys and OAuth credentials belong in macOS Keychain, not the application database, configuration file, shell command arguments, or agent-visible MCP inputs. Linux/Windows support and unattended system-daemon operation are outside the first release.
 
 This is a standalone checkpoint based on 1.0, not a migration or an implementation. The accompanying `db-structure.dbml` retains two tables: `subscriptions` and `delivery_attempts`. The table name `delivery_attempts` emphasizes that errors and unacknowledged responses are present alongside acknowledged deliveries.
 
@@ -14,6 +16,7 @@ Checkpoint 1.1 adds lean JSON response examples, requires whole-item delivery wi
 ## Decisions and scope
 
 - **Authorization:** Owner-configured agents receive grants to connections. Agents may modify their own subscriptions but cannot edit connections, credentials, grants, or their own identity.
+- **Platform and secrets:** Target macOS first, with native Keychain-backed credential storage and owner-operated authentication commands. Browser OAuth is a reusable contract for future OAuth-capable connections, not a prerequisite for the first public YouTube connection.
 - **Subscriptions:** One agent owner, one connection, one selector type, one shared content request/representation, and one default lookback. A selector may accept several channels, several playlists, or several timelines when supported; a Gmail query can express broad selection. Do not mix channel and playlist selector types inside one subscription.
 - **Direct discovery:** Discover supported targets within an authorized connection and explicit time window. Discovery returns references/metadata, not content-delivery receipts.
 - **Direct fetching:** Check the agent's retained acknowledgments. If already acknowledged, return an `already_served` notice unless explicitly overridden; an override performs a new fetch and requires a new acknowledgment.
@@ -39,7 +42,7 @@ Retain the six-part canonical identity and SHA-256 collision checking. Retain lo
 
 ## First connection: YouTube
 
-Implement one logical YouTube connection with two alternative discovery backends and one transcript-fetch backend. The owner may grant that connection to multiple agents; backend choice changes execution, not namespace, item identity, acknowledgment scope, or the subscription's one-selector rule.
+Implement a YouTube connection type with two alternative discovery backends and one transcript-fetch backend per configured instance. The owner may configure several independent instances and grant each to multiple agents; backend choice changes execution, not namespace, item identity, acknowledgment scope, or the subscription's one-selector rule.
 
 The agreed library choices are `yt-dlp` for discovery without configured credentials, `google-api-python-client` for API-key-based discovery, and `youtube_transcript_api` for fetching transcripts. Backend defaults and configuration spellings below are implementation recommendations, not a requirement to introduce additional persistent entities.
 
@@ -65,7 +68,7 @@ Proposed owner configuration shape:
 
 ```yaml
 connections:
-  youtube:
+  youtube1:
     id: "2c68e931-7f3a-4da0-8aa6-fda853d8a7e4"
     provider: youtube
     discovery:
@@ -73,12 +76,14 @@ connections:
       methods:
         yt_dlp: {}
         google_api:
-          api_key_ref: contenthub/youtube_data_api
+          api_key_ref: contenthub/youtube1/google_api
     fetch:
       method: youtube_transcript_api
 ```
 
-This is an illustrative credential reference, not an API key. Omit the `google_api` entry for a keyless configuration; never put the key value into subscription JSON, responses, identity options, or the ledger. Missing/invalid configured credentials make that method unavailable and produce a clear error when selected.
+Here `youtube1` is a unique owner-configured CLI alias, `id` is the stable connection UUID stored in subscriptions/receipts, and `provider: youtube` identifies the adapter type. A second instance such as `youtube2` must have a different stable UUID and ordinarily its own credential reference, for example `contenthub/youtube2/google_api`. Multiple instances may deliberately share a credential reference, but provider or method equality does not imply credential sharing.
+
+This is an illustrative credential reference, not an API key. Resolve `contenthub/youtube1/google_api` through the macOS Keychain credential provider described below. Omit the `google_api` entry for a keyless configuration; never put the key value into subscription JSON, responses, identity options, or the ledger. Missing/invalid configured credentials make that method unavailable for discovery and produce a clear error when selected for execution; they do not prevent the owner from selecting it for authentication setup.
 
 Expose an optional `discovery_method` argument on standalone discovery and subscription-fetch requests. A request may select only owner-enabled methods; omission uses the connection default, snapshotted on admission. Do not automatically run both methods or fail over between them. If a caller explicitly retries with the other backend, retain the same item identity and receipt checks.
 
@@ -135,6 +140,97 @@ MCP starts bound to an owner-selected agent identity. The worker authenticates t
 Every discovery, fetch, subscription mutation, continuation, acknowledgment, and ledger query checks agent ownership and current connection authorization. A guessed item key, delivery ID, cursor, or subscription ID is never a grant. Reading a receipt does not grant access to fetch its item.
 
 Owner connection/grant configuration initially remains restart-required. Restart invalidates old runtime sessions and cursors; no stale client can retain old permissions. Subscriptions whose owner or connection is absent/ungranted remain stored but unusable, with an explicit configuration/authorization error rather than silent deletion.
+
+### macOS runtime and Keychain storage
+
+Use the user's macOS session for the worker, owner CLI, and agent-bound MCP clients. Choose local IPC and packaging for that target; do not require root, a remote credential service, or a privileged system daemon. A per-user login helper can be considered later, but initial foreground/manual startup must work first. Document and test the supported macOS/Python builds during implementation rather than claiming an untested OS-version floor.
+
+Apple calls the credential facility Keychain, and the Keychain Access application manages stored keys, passwords, and related items ([Apple Keychain Access guide](https://support.apple.com/guide/keychain-access/what-is-keychain-access-kyca1083/mac)). Use a narrow credential-provider interface with a native macOS Keychain implementation; Python's `keyring` library supports that backend and exposes `set_password`, `get_password`, and `delete_password` operations ([keyring documentation](https://keyring.readthedocs.io/en/stable/index.html)).
+
+The proposed implementation uses `keyring.backends.macOS.Keyring` explicitly, or verifies that the selected backend is the native macOS backend. Reject null, plaintext-file, or unexpected fallback backends; a missing/locked/denied/unavailable credential must produce an actionable error rather than silently downgrade secret storage.
+
+Map the opaque configuration credential reference to a stable Keychain entry, for example service `contenthub` and account equal to the complete reference `contenthub/youtube1/google_api`. The account field here is a lookup label, not the upstream email address or item namespace. Although this example reference contains the initial alias, it is an opaque configured value: renaming the alias must not regenerate or delete its referenced credential. Several connections may share a reference only when deliberately configured by the owner.
+
+Store API-key values and future OAuth refresh tokens/token bundles in Keychain. Short-lived access tokens can be held in worker memory and renewed from the protected refresh token; persist any token needed across restarts only through the same credential provider. Never create a plaintext `token.json`, secret `.env`, token-bearing config entry, or custom encryption key stored beside encrypted secrets. Backups of configuration and metadata contain references only and require credentials to be provisioned separately.
+
+Keychain storage is not an additional sandbox against arbitrary code running as the owner: the keyring documentation warns that other scripts using the same Python executable may access its stored credentials without another prompt ([keyring macOS security notes](https://keyring.readthedocs.io/en/stable/index.html)). Keep MCP and local IPC ownership checks, never return secrets to agents, and do not promise protection from an agent with unrestricted host-shell access.
+
+### Unified owner authentication
+
+Use one owner command for credential setup and reauthentication. The owner selects a configured connection and optionally a method, not an authentication mechanism:
+
+```text
+contenthub auth <connection_id> [--method <method>]
+```
+
+`<connection_id>` accepts either the stable connection UUID or its unique configured alias, such as `youtube1` or `youtube2`; it never means the provider type or a request to authenticate every YouTube connection. Resolve the alias to the stable ID before acting, display the resolved connection/method, and reject unknown or ambiguous identifiers. Alias changes do not rewrite persisted connection IDs, grants, subscriptions, receipts, or credential references; configuration validation must prevent aliases that conflict with another connection's ID.
+
+Select the interaction using the adapter's declared authentication requirement for the owner-enabled method, not the presence/validity of a stored secret:
+
+- **API key:** Ask for hidden terminal input and store it through the configured Keychain reference.
+- **OAuth:** Open the system browser and perform the supported provider authorization flow, then store the resulting credentials through the configured Keychain reference.
+- **No authentication:** Explain that the selected method requires no credentials; do not prompt for a key, open a browser, or change configuration.
+- **Unsupported configuration:** Reject unknown/disabled methods or unsupported authentication flows explicitly. Authentication does not enable new methods, change grants, or silently choose another connection.
+
+When `--method` is omitted, choose the sole configured method requiring authentication, even if the default discovery method is keyless or credentials are missing. If several methods require authentication, ask the owner to choose; in noninteractive use return `method_required` with the permitted choices instead of hanging or guessing. If none require authentication, report that no setup is needed. An explicit `--method` always selects that method and does not fall back.
+
+For the illustrated YouTube configuration, `contenthub auth youtube1` selects `google_api`, while `contenthub auth youtube1 --method yt_dlp` reports that authentication is unnecessary. An entirely keyless configuration does not invent a Google method to authenticate. Independent instances are addressed separately:
+
+```text
+contenthub auth youtube1 --method google_api
+contenthub auth youtube2 --method google_api
+```
+
+This command shape and adaptive interaction are agreed design decisions, not implemented commands. Credential status, remote validation, and local logout remain separate owner operations; their exact CLI spellings are implementation choices, not authentication-type subcommands the user must remember.
+
+### API-key interaction
+
+The unified command detects that `google_api` needs an API key. With the illustrated configuration, the owner experience is:
+
+```text
+$ contenthub auth youtube1
+Connection: youtube1 (2c68e931-7f3a-4da0-8aa6-fda853d8a7e4)
+Method: google_api
+Authentication: API key
+API key: [hidden input]
+```
+
+The intended owner flow is:
+
+1. Create the API key in the provider's console and enable the required API; the YouTube Data API setup requires a Google Cloud project, credentials, and the API enabled ([Google setup guide](https://developers.google.com/youtube/data/getting-started)).
+2. Configure only the stable credential reference under the connection's method. Adding/changing that configuration requires the normal manual restart; the secret value itself is not configuration.
+3. Run `contenthub auth youtube1`, optionally with `--method google_api`; it opens a hidden terminal prompt for the owner to paste the value. Do not accept the value as a command-line argument, echo it, place it in shell history, or ask an agent to pass it through MCP.
+4. Write the value to the configured Keychain entry and report only that it was stored. If writing fails, do not report successful setup.
+5. Let the owner credential-check operation make an explicit, bounded provider validation request. Report whether the credential is stored separately from whether the most recent remote check succeeded; a stored key is not proof of validity or sufficient quota.
+
+The worker resolves the reference when executing the configured method and keeps secrets only in necessary in-process client state. A successful owner credential update invalidates the running worker's affected credential/client cache through authenticated owner control, including all connections deliberately sharing that reference; with no running worker, the next startup reads Keychain. Before replacing a shared credential, show its affected connections and obtain owner confirmation. New requests use the replacement after revalidation; already in-flight requests may complete with their original credentials. This does not hot-reload connection definitions or grants.
+
+When the worker cannot access Keychain without user interaction, return `credentials_unavailable` or `authentication_required` to the agent with an owner-facing setup instruction. Do not make an agent request launch an indefinite password/Keychain prompt. Owner setup/check commands may surface macOS access prompts and must handle cancellation without logging the secret.
+
+### Owner OAuth login for future connections
+
+OAuth uses a different setup flow from pasting an API key. For Google desktop apps, application registration, browser consent, PKCE, a loopback redirect, and token exchange are described in the installed-app OAuth guide ([Google desktop OAuth documentation](https://developers.google.com/identity/protocols/oauth2/native-app)). The current public YouTube connection does not need OAuth: its Google discovery route uses an API key, and its other selected routes remain keyless.
+
+For a future configured OAuth-capable connection, the same command chooses the browser interaction:
+
+```text
+$ contenthub auth gmail_personal
+Connection: gmail_personal
+Authentication: OAuth
+Opening your browser…
+```
+
+`gmail_personal` is an illustrative future connection, not an implemented Gmail adapter. The provider must support and configure an appropriate desktop-app authorization flow; use its supported OAuth library rather than hand-writing token exchange. Unsupported connections return `auth_method_not_supported` instead of attempting a generic login.
+
+- **Application registration:** Before the first login, configure the provider's OAuth client ID, permitted redirect flow, and required scopes. An API key cannot substitute for this registration. Google documents a Desktop app client type and treats desktop clients as public clients that cannot rely on a confidential embedded client secret ([Google desktop OAuth documentation](https://developers.google.com/identity/protocols/oauth2/native-app)). Keep nonsecret client IDs/scopes in owner configuration; if a provider library needs a client-secret value, resolve it through Keychain rather than committing a downloaded credential file.
+- **Explicit trigger:** `contenthub auth gmail_personal` displays the target connection/provider and requested scopes, then opens the system browser for the owner to choose an account and consent. Use narrowly scoped read access for retrieval; the agent cannot expand scopes or edit the connection grants.
+- **Callback protection:** For providers supporting this desktop flow, use authorization code plus PKCE S256 and random state, with a short-lived listener bound only to loopback on an available port. Validate state, redirect and transaction lifetime, reject unsolicited callbacks, and close the listener on completion/cancellation/timeout. This temporary callback is not a public MCP server.
+- **Token and account validation:** Exchange the authorization code through the provider SDK, verify the granted scopes and stable upstream account identity, and require any configured account expectation to match before activating credentials. Store the refresh token/token bundle in Keychain; do not write browser cookies, authorization codes, or tokens to the content ledger or logs.
+- **Refresh:** Request supported offline access where needed. Google documents obtaining new access tokens using a refresh token without prompting the user again and treats invalid/expired refresh tokens as a reason to reauthenticate ([Google refresh-token guidance](https://developers.google.com/identity/protocols/oauth2/native-app)). Coordinate refresh per shared connection/credential reference, preserve replacement refresh tokens if returned, and avoid concurrent writes that restore stale tokens.
+- **Expired or revoked access:** Report `authentication_required` with the owner command to rerun, rather than automatically opening a browser during an agent request. Normal successful token refresh and same-account login do not require a configuration restart; changing scopes, grants, client settings, or upstream account identity is not credential refresh and follows configuration/account-change rules.
+- **Logout:** Define local credential removal/cache invalidation separately from provider-side token revocation. Confirm the affected configured references before deleting a shared credential; deleting a local token alone must not be described as revoking the provider grant. An optional explicit revocation action requires provider support and owner authorization.
+
+Retain the same account/namespace checks on all subsequent discovery and fetch operations. Choosing a different account during reauthentication must not silently rebind an existing private connection ID or expand any agent's access.
 
 ### Connections and upstream identity
 
@@ -444,7 +540,7 @@ That future feature must explicitly choose whether delivery waits for storage, h
 
 ## Proposed interfaces
 
-Exact names and argument shapes are implementation proposals. The behavioral separation, authorization, identity, and acknowledgment rules above are normative.
+The MCP names and argument shapes below are implementation proposals. The behavioral separation, authorization, identity, and acknowledgment rules above are normative; the unified owner-auth command is separately agreed.
 
 ```text
 list_connections()
@@ -473,7 +569,7 @@ Provider-specific discovery methods may wrap the typed discovery contract. Clien
 
 `discovery_method` is an optional execution-routing choice among owner-enabled connection backends, not an item option. For a multi-connection subscription request, apply an override only when every involved connection advertises it, otherwise reject before starting work; the first YouTube connection supports the two method keys specified above subject to key availability. Continuation inherits the admitted method and cannot switch it mid-request.
 
-Proposed owner CLI functions cover configuration validation, worker/MCP startup, connection authentication, status, ledger inspection/purge, and metadata backup. There is no archive search, correction/reprocessing-from-disk command, durable-job resume, or mandatory standalone backfill command. Historical collection uses explicit discovery/subscription windows or direct identities.
+The agreed owner authentication entry point is `contenthub auth <connection_id> [--method <method>]`, which resolves the configured connection and chooses hidden API-key entry, browser OAuth, or a no-authentication explanation. Other proposed owner CLI functions cover configuration validation, worker/MCP startup, credential status/check/logout, ledger inspection/purge, and metadata backup. Interactive credential entry and OAuth login are owner-only, not agent MCP tools; agents receive actionable authentication errors without secret values. There is no archive search, correction/reprocessing-from-disk command, durable-job resume, or mandatory standalone backfill command. Historical collection uses explicit discovery/subscription windows or direct identities.
 
 ## Persistent schema and implementation boundary
 
@@ -493,6 +589,10 @@ Accept acknowledgments for already delivered items while shutdown can safely com
 
 ## Acceptance tests
 
+- **macOS credentials:** Run integration tests on the supported macOS/Python environment with the native Keychain backend. Test set/read/update/delete, missing entries, denied/locked/unavailable storage, and rejected insecure backends; use fake credentials and clean up test entries. No secret appears in configuration, arguments, logs, metadata backups, DB rows, or MCP responses.
+- **Unified owner auth:** Resolve a stable UUID or unique alias to exactly one configured connection. Test independent `youtube1`/`youtube2` credentials, deliberate shared-reference confirmation/cache invalidation, automatic selection of the sole authentication-requiring method despite a keyless discovery default, explicit keyless selection, entirely keyless configuration, ambiguous-method prompting/noninteractive errors, and unknown/disabled-method rejection. Missing credentials remain eligible for setup; authentication never changes grants or enables methods.
+- **API-key owner flow:** Hidden input writes to the configured Keychain reference; storage success is distinct from remote validation. Rotation invalidates affected clients without hot-reloading grants; a missing Google key leaves the keyless YouTube methods usable.
+- **Future OAuth contract:** When the first OAuth adapter is implemented, test explicit owner browser login, PKCE/state/callback validation, scope/account mismatch, cancellation, token refresh/rotation, shared-credential concurrency, and local logout versus remote revocation. These are not claims of implemented OAuth support for the current YouTube adapter.
 - **Agent isolation:** Reject forged agent, subscription, delivery, and cursor ownership; filter ledger results and connection capabilities by current grants. Never reuse one agent's content buffers for another.
 - **Shared connections:** Several granted agents may use one connection definition and credential reference while sharing its concurrency/rate budget. Subscriptions, buffers, and acknowledgment history stay agent-specific; a namespace match never grants another route.
 - **Connection validation:** Unknown/mismatched private targets fail closed; connection rename/credential rotation preserves identity, and unrelated account reassignment cannot silently inherit a connection ID.
@@ -520,8 +620,8 @@ Accept acknowledgments for already delivered items while shutdown can safely com
 
 ## Remaining implementation choices
 
-The initial source/library scope is now specified: public YouTube channel/playlist discovery through `yt_dlp` or `google_api`, with transcripts fetched through `youtube_transcript_api`. Remaining implementation choices include tested dependency versions and runtime prerequisites, exact MCP/config schemas, canonical JSON test vectors, local IPC and shutdown mechanism, retry/timeouts, payload/batch/queue/memory limits, and receipt retention. Private-source namespace resolution and binary media delivery belong to later adapters; per-item chunking remains excluded.
+The initial source/library scope and platform are now specified: macOS with Keychain credential storage, public YouTube channel/playlist discovery through `yt_dlp` or `google_api`, and transcripts fetched through `youtube_transcript_api`. Remaining implementation choices include tested macOS/Python/dependency versions, exact MCP/config schemas, canonical JSON test vectors, macOS-local IPC and shutdown mechanism, retry/timeouts, payload/batch/queue/memory limits, and receipt retention. Concrete OAuth-provider integration, private-source namespace resolution, and binary media delivery belong to later adapters; per-item chunking remains excluded.
 
-Pull-driven collection, owner-file grants, two-table placement, owner-only purge, and concrete interface spellings are explicit implementation recommendations, not separate user-approved numeric defaults. Validate them during implementation without silently restoring archive semantics or treating examples as deployed capabilities.
+Pull-driven collection, owner-file grants, two-table placement, owner-only purge, and other proposed interface spellings remain explicit implementation recommendations, not separate user-approved numeric defaults. The unified owner-auth command and its connection/method selection behavior are agreed. Validate implementation choices without silently restoring archive semantics or treating examples as deployed capabilities.
 
 Begin with a fake adapter, two agents, editable subscriptions, the two-table ledger, acknowledgment/override tests, and bounded shared queues. Then implement both YouTube discovery backends, the common transcript fetcher, and progressive whole-item delivery. Preserve checkpoint 1.0 unchanged. The two persistent tables and their columns/indexes are unchanged by 1.1; adopting this design must not silently delete existing data, and any necessary migration/export requires a separate reviewed decision.
